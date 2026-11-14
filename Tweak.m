@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <AudioUnit/AudioUnit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
@@ -140,19 +141,21 @@ static int rebind_symbols(struct rebinding rebindings[], size_t nel) {
 }
 
 // ==========================================
-// 2. 档位配置（原子缓存，音频线程实时读取）
+// 2. 档位与实时命中状态统计
 // ==========================================
 static NSString * const kHQVoiceLevelKey = @"com.custom.wechat.hqvoice.level";
 static NSString * const kHQVoiceLevelChangedNotification = @"HQVoiceLevelDidChangeNotification";
 
 typedef NS_ENUM(NSInteger, HQVoiceLevel) {
-    HQVoiceLevelOff    = 0, // 关闭（微信原生）
-    HQVoiceLevelLow    = 1, // 小等（轻度清晰去闷）
-    HQVoiceLevelMedium = 2, // 中等（播客磁性人声）
-    HQVoiceLevelHigh   = 3  // 最高（电台棚感 · 声卡/清唱）
+    HQVoiceLevelOff    = 0,
+    HQVoiceLevelLow    = 1,
+    HQVoiceLevelMedium = 2,
+    HQVoiceLevelHigh   = 3
 };
 
 static _Atomic(NSInteger) gCachedVoiceLevel = HQVoiceLevelOff;
+static _Atomic(uint64_t) gHitPacketsCount = 0;
+static _Atomic(uint32_t) gDetectedSampleRate = 0;
 
 static HQVoiceLevel GetCurrentVoiceLevel(void) {
     return (HQVoiceLevel)atomic_load(&gCachedVoiceLevel);
@@ -167,9 +170,9 @@ static void SetCurrentVoiceLevel(HQVoiceLevel level) {
 
 static NSString *GetVoiceLevelFullName(HQVoiceLevel level) {
     switch (level) {
-        case HQVoiceLevelLow:    return @"小等 (自然清晰 · 去电话闷感)";
+        case HQVoiceLevelLow:    return @"小等 (自然清晰 · 轻度去闷)";
         case HQVoiceLevelMedium: return @"中等 (播客磁性 · 饱满人声)";
-        case HQVoiceLevelHigh:   return @"最高 (电台棚感 · 声卡/清唱)";
+        case HQVoiceLevelHigh:   return @"最高 (卸除电话滤镜 · 棚感直采)";
         default:                 return @"已关闭 (微信原生音质)";
     }
 }
@@ -184,7 +187,7 @@ static NSString *GetVoiceLevelShortTag(HQVoiceLevel level) {
 }
 
 // ==========================================
-// 3. 音质选择弹窗 UI
+// 3. 音质选择弹窗 UI（带实时拦截命中计数）
 // ==========================================
 static UIViewController *FindTopViewController(void) {
     UIWindow *keyWindow = nil;
@@ -208,10 +211,17 @@ static UIViewController *FindTopViewController(void) {
 
 static void ShowHQVoiceControlMenu(void) {
     HQVoiceLevel current = GetCurrentVoiceLevel();
-    NSString *title = [NSString stringWithFormat:@"语音条音质调节\n当前：%@", GetVoiceLevelFullName(current)];
+    uint64_t hits = atomic_load(&gHitPacketsCount);
+    uint32_t sr = atomic_load(&gDetectedSampleRate);
+
+    NSString *statusLine = (sr > 0)
+        ? [NSString stringWithFormat:@"已接管音频包：%llu 次（硬件采样 %uHz）", hits, sr]
+        : [NSString stringWithFormat:@"已接管音频包：%llu 次（录音后刷新可见）", hits];
+
+    NSString *title = [NSString stringWithFormat:@"语音条音质调节\n当前：%@\n%@", GetVoiceLevelFullName(current), statusLine];
 
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
-                                                                   message:@"安静房间或接声卡建议选「最高」；刮风马路/地铁建议选「关闭」以保留系统降噪。"
+                                                                   message:@"切换档位后，下一次按住说话立即生效。"
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSNumber *> *levels = @[
@@ -261,29 +271,20 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL newSel) {
 }
 
 // ==========================================
-// 5. 播客级双频段 Biquad 均衡器 + 动态压缩 DSP（不改采样率，零变调）
+// 5. 核心 DSP 处理器（支持 Int16 与 Float32 麦克风流，零变调）
 // ==========================================
 typedef struct {
     float b0, b1, b2, a1, a2;
     float x1, x2, y1, y2;
 } BiquadFilter;
 
-typedef struct {
-    AudioQueueInputCallback origCallback;
-    void *origUserData;
-    BOOL is16BitMonoPCM;
-    double sampleRate;
-    HQVoiceLevel configuredLevel;
-    BiquadFilter warmthShelf;   // 180Hz 胸腔厚度补偿
-    BiquadFilter presencePeak;  // 3.8kHz 齿音与通透度提亮
-    float hpPrevX;
-    float hpPrevY;
-    float envFollower;
-} HQAudioContext;
-
-#define kMaxHQContexts 32
-static HQAudioContext gAudioContexts[kMaxHQContexts];
-static _Atomic(uint32_t) gContextCursor = 0;
+static BiquadFilter gWarmthFilter;
+static BiquadFilter gPresenceFilter;
+static HQVoiceLevel gFilterConfiguredLevel = HQVoiceLevelOff;
+static float gFilterConfiguredRate = 0.0f;
+static float gHpPrevX = 0.0f;
+static float gHpPrevY = 0.0f;
+static float gEnvFollower = 0.0f;
 
 static void SetupLowShelfFilter(BiquadFilter *f, float fs, float f0, float dBgain) {
     float A = powf(10.0f, dBgain / 40.0f);
@@ -325,145 +326,157 @@ static inline float ProcessBiquad(BiquadFilter *f, float x) {
     return y;
 }
 
-static inline int16_t SoftLimitPCM(float sample) {
-    const float threshold = 25000.0f;
-    const float maxVal = 32600.0f;
+static inline float SoftLimitFloat(float sample, float threshold, float maxVal, float knee) {
     float absVal = fabsf(sample);
     if (absVal > threshold) {
         float excess = absVal - threshold;
-        float compressed = threshold + (maxVal - threshold) * (excess / (excess + 7600.0f));
+        float compressed = threshold + (maxVal - threshold) * (excess / (excess + knee));
         sample = (sample >= 0.0f) ? compressed : -compressed;
     }
-    if (sample > 32767.0f) return 32767;
-    if (sample < -32768.0f) return -32768;
-    return (int16_t)sample;
+    if (sample > maxVal) return maxVal;
+    if (sample < -maxVal) return -maxVal;
+    return sample;
 }
 
-static void ConfigureFiltersForLevel(HQAudioContext *ctx, HQVoiceLevel level) {
-    float fs = (ctx->sampleRate > 0.0) ? (float)ctx->sampleRate : 16000.0f;
+static void EnsureFiltersConfigured(HQVoiceLevel level, float sampleRate) {
+    if (sampleRate <= 0.0f) sampleRate = 16000.0f;
+    if (gFilterConfiguredLevel == level && fabsf(gFilterConfiguredRate - sampleRate) < 1.0f) return;
+
     float warmthDb = 0.0f;
     float presenceDb = 0.0f;
-
     switch (level) {
         case HQVoiceLevelLow:
-            warmthDb = 1.8f;
-            presenceDb = 2.8f;
+            warmthDb = 2.2f;
+            presenceDb = 3.5f;
             break;
         case HQVoiceLevelMedium:
-            warmthDb = 3.2f;
-            presenceDb = 4.8f;
+            warmthDb = 4.0f;
+            presenceDb = 5.8f;
             break;
         case HQVoiceLevelHigh:
-            warmthDb = 4.2f;
-            presenceDb = 6.5f;
+            warmthDb = 5.5f;
+            presenceDb = 8.0f;
             break;
         default:
             break;
     }
 
-    SetupLowShelfFilter(&ctx->warmthShelf, fs, 185.0f, warmthDb);
-    SetupPeakingFilter(&ctx->presencePeak, fs, 3800.0f, 1.15f, presenceDb);
-    ctx->configuredLevel = level;
+    memset(&gWarmthFilter, 0, sizeof(BiquadFilter));
+    memset(&gPresenceFilter, 0, sizeof(BiquadFilter));
+    SetupLowShelfFilter(&gWarmthFilter, sampleRate, 180.0f, warmthDb);
+    SetupPeakingFilter(&gPresenceFilter, sampleRate, 3600.0f, 1.1f, presenceDb);
+
+    gFilterConfiguredLevel = level;
+    gFilterConfiguredRate = sampleRate;
 }
 
-static void ProcessBroadcastVocalPCM(HQAudioContext *ctx, AudioQueueBufferRef inBuffer, HQVoiceLevel level) {
-    if (level == HQVoiceLevelOff || !ctx->is16BitMonoPCM || !inBuffer || !inBuffer->mAudioData) return;
+static void ProcessPCMBufferInPlace(void *data, UInt32 byteSize, UInt32 frameCount, BOOL isFloat32, float sampleRate, HQVoiceLevel level) {
+    if (!data || frameCount == 0 || level == HQVoiceLevelOff) return;
+    EnsureFiltersConfigured(level, sampleRate);
 
-    UInt32 sampleCount = inBuffer->mAudioDataByteSize / sizeof(int16_t);
-    if (sampleCount == 0) return;
-
-    if (ctx->configuredLevel != level) {
-        ConfigureFiltersForLevel(ctx, level);
-    }
-
-    // 补偿关闭 iOS 通话 AGC 后的音量损失，让电台感与气声细节充分展现
-    float baseMakeupGain = 1.0f;
-    float compStrength = 0.0f;
+    float gain = 1.0f;
+    float comp = 0.0f;
     switch (level) {
-        case HQVoiceLevelLow:
-            baseMakeupGain = 1.45f;
-            compStrength = 0.20f;
-            break;
-        case HQVoiceLevelMedium:
-            baseMakeupGain = 2.05f;
-            compStrength = 0.35f;
-            break;
-        case HQVoiceLevelHigh:
-            baseMakeupGain = 2.75f; // +8.8dB，补偿 Measurement 无 AGC 衰减，人声饱满有磁性
-            compStrength = 0.50f;
-            break;
-        default:
-            return;
+        case HQVoiceLevelLow:    gain = 1.55f; comp = 0.25f; break;
+        case HQVoiceLevelMedium: gain = 2.25f; comp = 0.40f; break;
+        case HQVoiceLevelHigh:   gain = 3.10f; comp = 0.55f; break;
+        default: return;
     }
 
-    int16_t *samples = (int16_t *)inBuffer->mAudioData;
-    float hpPrevX = ctx->hpPrevX;
-    float hpPrevY = ctx->hpPrevY;
-    float env = ctx->envFollower;
+    if (isFloat32) {
+        float *samples = (float *)data;
+        UInt32 count = byteSize / sizeof(float);
+        for (UInt32 i = 0; i < count; i++) {
+            float x = samples[i];
+            float hp = x - gHpPrevX + 0.972f * gHpPrevY;
+            gHpPrevX = x;
+            gHpPrevY = hp;
 
-    for (UInt32 i = 0; i < sampleCount; i++) {
-        float x = (float)samples[i];
+            float eq = ProcessBiquad(&gPresenceFilter, ProcessBiquad(&gWarmthFilter, hp));
+            float absSig = fabsf(eq);
+            gEnvFollower = 0.996f * gEnvFollower + 0.004f * absSig;
+            float ratio = (gEnvFollower > 0.11f) ? (1.0f - comp * ((gEnvFollower - 0.11f) / (gEnvFollower + 0.20f))) : 1.0f;
 
-        // 1) 70Hz 高通滤波：滤除喷麦低频轰鸣与手持摩擦底噪
-        float hp = x - hpPrevX + 0.972f * hpPrevY;
-        hpPrevX = x;
-        hpPrevY = hp;
+            samples[i] = SoftLimitFloat(eq * gain * ratio, 0.78f, 0.98f, 0.22f);
+        }
+    } else {
+        int16_t *samples = (int16_t *)data;
+        UInt32 count = byteSize / sizeof(int16_t);
+        for (UInt32 i = 0; i < count; i++) {
+            float x = (float)samples[i];
+            float hp = x - gHpPrevX + 0.972f * gHpPrevY;
+            gHpPrevX = x;
+            gHpPrevY = hp;
 
-        // 2) 双频段电台 EQ：补足 185Hz 胸腔磁性 + 提亮 3.8kHz 齿音通透度
-        float warmed = ProcessBiquad(&ctx->warmthShelf, hp);
-        float bright = ProcessBiquad(&ctx->presencePeak, warmed);
+            float eq = ProcessBiquad(&gPresenceFilter, ProcessBiquad(&gWarmthFilter, hp));
+            float absSig = fabsf(eq);
+            gEnvFollower = 0.996f * gEnvFollower + 0.004f * absSig;
+            float ratio = (gEnvFollower > 3600.0f) ? (1.0f - comp * ((gEnvFollower - 3600.0f) / (gEnvFollower + 6500.0f))) : 1.0f;
 
-        // 3) 播客级动态包络压缩：托起轻声细节，防止大声炸麦
-        float absSig = fabsf(bright);
-        env = 0.996f * env + 0.004f * absSig;
-        float dynamicRatio = 1.0f;
-        if (env > 3500.0f) {
-            dynamicRatio = 1.0f - compStrength * ((env - 3500.0f) / (env + 6000.0f));
+            samples[i] = (int16_t)SoftLimitFloat(eq * gain * ratio, 25500.0f, 32500.0f, 7200.0f);
+        }
+    }
+}
+
+// ==========================================
+// 6. 微信 8.0.75 CoreAudio / AudioUnit 全链路拦截
+// ==========================================
+
+// 6.1 拦截 VoiceProcessingIO（电话语音单元）-> 替换为 RemoteIO（无滤波直采单元）
+static AudioComponent (*orig_AudioComponentFindNext)(AudioComponent inComponent, const AudioComponentDescription *inDesc);
+
+static AudioComponent my_AudioComponentFindNext(AudioComponent inComponent, const AudioComponentDescription *inDesc) {
+    HQVoiceLevel level = GetCurrentVoiceLevel();
+    if (level != HQVoiceLevelOff && inDesc != NULL &&
+        inDesc->componentType == kAudioUnitType_Output &&
+        inDesc->componentSubType == kAudioUnitSubType_VoiceProcessingIO) {
+        AudioComponentDescription modDesc = *inDesc;
+        modDesc.componentSubType = kAudioUnitSubType_RemoteIO;
+        return orig_AudioComponentFindNext(inComponent, &modDesc);
+    }
+    return orig_AudioComponentFindNext(inComponent, inDesc);
+}
+
+// 6.2 兼容降级后的属性设置，防止微信设置电话单元专有属性时报错中断
+static OSStatus (*orig_AudioUnitSetProperty)(AudioUnit inUnit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void *inData, UInt32 inDataSize);
+
+static OSStatus my_AudioUnitSetProperty(AudioUnit inUnit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void *inData, UInt32 inDataSize) {
+    OSStatus err = orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
+    if (err != noErr && GetCurrentVoiceLevel() != HQVoiceLevelOff && inID >= 2100 && inID <= 2199) {
+        return noErr;
+    }
+    return err;
+}
+
+// 6.3 拦截微信 8.0.75 麦克风渲染总线（Bus 1）实时 PCM 数据
+static OSStatus (*orig_AudioUnitRender)(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData);
+
+static OSStatus my_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
+    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    if (status == noErr && inBusNumber == 1 && ioData != NULL && ioData->mNumberBuffers > 0) {
+        atomic_fetch_add(&gHitPacketsCount, 1);
+
+        AudioStreamBasicDescription asbd;
+        UInt32 propSize = sizeof(asbd);
+        float sampleRate = 16000.0f;
+        BOOL isFloat = NO;
+
+        if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &asbd, &propSize) == noErr) {
+            sampleRate = (float)asbd.mSampleRate;
+            isFloat = ((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0);
+            atomic_store(&gDetectedSampleRate, (uint32_t)asbd.mSampleRate);
         }
 
-        samples[i] = SoftLimitPCM(bright * baseMakeupGain * dynamicRatio);
+        HQVoiceLevel level = GetCurrentVoiceLevel();
+        if (level != HQVoiceLevelOff) {
+            AudioBuffer *buf = &ioData->mBuffers[0];
+            ProcessPCMBufferInPlace(buf->mData, buf->mDataByteSize, inNumberFrames, isFloat, sampleRate, level);
+        }
     }
-
-    ctx->hpPrevX = hpPrevX;
-    ctx->hpPrevY = hpPrevY;
-    ctx->envFollower = env;
+    return status;
 }
 
-static void HQ_AudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer, const AudioTimeStamp *inStartTime, UInt32 inNumberPacketDescriptions, const AudioStreamPacketDescription *inPacketDescs) {
-    HQAudioContext *ctx = (HQAudioContext *)inUserData;
-    if (!ctx || !ctx->origCallback) return;
-
-    HQVoiceLevel level = GetCurrentVoiceLevel();
-    if (level != HQVoiceLevelOff) {
-        ProcessBroadcastVocalPCM(ctx, inBuffer, level);
-    }
-
-    ctx->origCallback(ctx->origUserData, inAQ, inBuffer, inStartTime, inNumberPacketDescriptions, inPacketDescs);
-}
-
-static OSStatus (*orig_AudioQueueNewInput)(const AudioStreamBasicDescription *inFormat, AudioQueueInputCallback inCallbackProc, void *inUserData, CFRunLoopRef inCallbackRunLoop, CFStringRef inCallbackRunLoopMode, UInt32 inFlags, AudioQueueRef *outAQ);
-
-static OSStatus my_AudioQueueNewInput(const AudioStreamBasicDescription *inFormat, AudioQueueInputCallback inCallbackProc, void *inUserData, CFRunLoopRef inCallbackRunLoop, CFStringRef inCallbackRunLoopMode, UInt32 inFlags, AudioQueueRef *outAQ) {
-    if (inCallbackProc != NULL && inFormat != NULL) {
-        uint32_t idx = atomic_fetch_add(&gContextCursor, 1) % kMaxHQContexts;
-        HQAudioContext *ctx = &gAudioContexts[idx];
-        memset(ctx, 0, sizeof(HQAudioContext));
-        ctx->origCallback = inCallbackProc;
-        ctx->origUserData = inUserData;
-        ctx->sampleRate = inFormat->mSampleRate;
-        ctx->configuredLevel = HQVoiceLevelOff;
-        ctx->is16BitMonoPCM = (inFormat->mFormatID == kAudioFormatLinearPCM &&
-                               inFormat->mBitsPerChannel == 16 &&
-                               inFormat->mChannelsPerFrame == 1);
-
-        return orig_AudioQueueNewInput(inFormat, HQ_AudioQueueInputCallback, ctx, inCallbackRunLoop, inCallbackRunLoopMode, inFlags, outAQ);
-    }
-    return orig_AudioQueueNewInput(inFormat, inCallbackProc, inUserData, inCallbackRunLoop, inCallbackRunLoopMode, inFlags, outAQ);
-}
-
-// ==========================================
-// 6. 解除系统通话模式滤波
-// ==========================================
+// 6.4 解除 AVAudioSession 通话模式过滤
 static AVAudioSessionMode ResolveMappedAudioMode(AVAudioSessionMode mode) {
     HQVoiceLevel level = GetCurrentVoiceLevel();
     if (level != HQVoiceLevelOff && [mode isEqualToString:AVAudioSessionModeVoiceChat]) {
@@ -490,61 +503,7 @@ static AVAudioSessionMode ResolveMappedAudioMode(AVAudioSessionMode mode) {
 @end
 
 // ==========================================
-// 7. 安全扫描 SilkAudioRecorder 内存控制块（不改采样率，只提码率）
-// ==========================================
-static void PatchSilkControlStructSafely(id recorderObj) {
-    HQVoiceLevel level = GetCurrentVoiceLevel();
-    if (level == HQVoiceLevelOff || !recorderObj) return;
-
-    int targetBitRate = (level == HQVoiceLevelHigh) ? 40000 : ((level == HQVoiceLevelMedium) ? 32000 : 24000);
-    size_t instSize = class_getInstanceSize([recorderObj class]);
-    if (instSize < 32 || instSize > 4096) return;
-
-    int32_t *words = (int32_t *)(__bridge void *)recorderObj;
-    size_t wordCount = instSize / sizeof(int32_t);
-
-    // 匹配 SKP_Silk_SDK_EncControlStruct 连续内存特征: [API_sampleRate, maxInternalSampleRate, packetSize, bitRate, ...]
-    for (size_t i = 0; i + 7 < wordCount; i++) {
-        int32_t apiSr = words[i];
-        int32_t maxSr = words[i + 1];
-        int32_t pktSz = words[i + 2];
-        int32_t br    = words[i + 3];
-
-        BOOL validSr = (apiSr == 16000 || apiSr == 24000);
-        BOOL validMaxSr = (maxSr == 16000 || maxSr == 24000);
-        BOOL validPkt = (pktSz == 320 || pktSz == 480);
-        BOOL validBr = (br >= 8000 && br <= 32000);
-
-        if (validSr && validMaxSr && validPkt && validBr) {
-            // 保持 apiSr 和 pktSz 不变（绝对不变调），只拉高内部采样率、码率并关闭静音吞音
-            words[i + 1] = 24000;
-            words[i + 3] = targetBitRate;
-            words[i + 5] = 2; // complexity = 2
-            words[i + 6] = 0; // useInBandFEC = 0
-            words[i + 7] = 0; // useDTX = 0
-            break;
-        }
-    }
-}
-
-@implementation NSObject (HQSilkRecorderMemoryHook)
-
-- (BOOL)hq_prepareRecord {
-    BOOL ret = [self hq_prepareRecord];
-    PatchSilkControlStructSafely(self);
-    return ret;
-}
-
-- (BOOL)hq_prepareRecordWithNotify:(BOOL)notify {
-    BOOL ret = [self hq_prepareRecordWithNotify:notify];
-    PatchSilkControlStructSafely(self);
-    return ret;
-}
-
-@end
-
-// ==========================================
-// 8. 语音条快捷呼出菜单交互挂载
+// 7. 语音条快捷呼出菜单交互挂载
 // ==========================================
 static const void *kHQVoiceBarBoundKey = &kHQVoiceBarBoundKey;
 
@@ -607,7 +566,7 @@ static const void *kHQVoiceBarBoundKey = &kHQVoiceBarBoundKey;
 @end
 
 // ==========================================
-// 9. 动态库入口初始化
+// 8. 动态库入口初始化
 // ==========================================
 __attribute__((constructor))
 static void HQVoicePluginInit(void) {
@@ -615,18 +574,16 @@ static void HQVoicePluginInit(void) {
         NSInteger savedLevel = [[NSUserDefaults standardUserDefaults] integerForKey:kHQVoiceLevelKey];
         atomic_store(&gCachedVoiceLevel, savedLevel);
 
-        struct rebinding reb = { "AudioQueueNewInput", (void *)my_AudioQueueNewInput, (void **)&orig_AudioQueueNewInput };
-        rebind_symbols(&reb, 1);
+        struct rebinding rebs[] = {
+            { "AudioComponentFindNext", (void *)my_AudioComponentFindNext, (void **)&orig_AudioComponentFindNext },
+            { "AudioUnitSetProperty",   (void *)my_AudioUnitSetProperty,   (void **)&orig_AudioUnitSetProperty },
+            { "AudioUnitRender",        (void *)my_AudioUnitRender,        (void **)&orig_AudioUnitRender }
+        };
+        rebind_symbols(rebs, 3);
 
         Class sessionCls = [AVAudioSession class];
         SwizzleInstanceMethod(sessionCls, @selector(setMode:error:), @selector(hq_setMode:error:));
         SwizzleInstanceMethod(sessionCls, @selector(setCategory:mode:options:error:), @selector(hq_setCategory:mode:options:error:));
-
-        Class silkRecorderCls = NSClassFromString(@"SilkAudioRecorder");
-        if (silkRecorderCls) {
-            SwizzleInstanceMethod(silkRecorderCls, NSSelectorFromString(@"prepareRecord"), @selector(hq_prepareRecord));
-            SwizzleInstanceMethod(silkRecorderCls, NSSelectorFromString(@"prepareRecordWithNotify:"), @selector(hq_prepareRecordWithNotify:));
-        }
 
         Class btnCls = [UIButton class];
         SwizzleInstanceMethod(btnCls, @selector(setTitle:forState:), @selector(hq_setTitle:forState:));
