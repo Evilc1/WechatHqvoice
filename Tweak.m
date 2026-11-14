@@ -171,9 +171,9 @@ static void SetCurrentVoiceLevel(HQVoiceLevel level) {
 
 static NSString *GetVoiceLevelFullName(HQVoiceLevel level) {
     switch (level) {
-        case HQVoiceLevelLow:    return @"小等 (自然清晰 · 轻度去闷)";
-        case HQVoiceLevelMedium: return @"中等 (播客磁性 · 饱满人声)";
-        case HQVoiceLevelHigh:   return @"最高 (电台谐波激励 · 40kbps)";
+        case HQVoiceLevelLow:    return @"小等 (自然通透 · 去闷感)";
+        case HQVoiceLevelMedium: return @"中等 (清脆播客 · 降底噪)";
+        case HQVoiceLevelHigh:   return @"最高 (极致清透 · 空气感拉满)";
         default:                 return @"已关闭 (微信原生音质)";
     }
 }
@@ -273,7 +273,7 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL newSel) {
 }
 
 // ==========================================
-// 5. 电台谐波激励器 + 双频段 EQ + 播客级压缩 DSP（穿透 SILK 压缩）
+// 5. 专攻“清透空气感”的混音级 DSP（砍闷声 + 提空气 + 智能底噪门限）
 // ==========================================
 typedef struct {
     float b0, b1, b2, a1, a2;
@@ -288,36 +288,20 @@ typedef struct {
     uint32_t bytesPerFrame;
     BOOL isFloat32;
     HQVoiceLevel configuredLevel;
-    BiquadFilter chestShelf;     // 165Hz 胸腔厚度补偿
-    BiquadFilter airPeak;        // 3.5kHz 唇齿空气感提亮
-    BiquadFilter exciterBand;    // 高频谐波提取带通
-    float hpPrevX;
-    float hpPrevY;
+    BiquadFilter highPass115Hz;   // 115Hz 高通：切掉手持闷声与低频浑浊
+    BiquadFilter deMud260Hz;      // 260Hz 陷波：消除“电话听筒/捂嘴闷罐感”
+    BiquadFilter airSparkle5kHz;  // 5.2kHz 空气感提亮：拉满唇齿通透度
+    BiquadFilter exciterBand;     // 3.2kHz 以上高频谐波激励带通
     float envFollower;
+    float gateGain;
 } HQAudioContext;
 
 #define kMaxHQContexts 32
 static HQAudioContext gAudioContexts[kMaxHQContexts];
 static _Atomic(uint32_t) gContextCursor = 0;
 
-static void SetupLowShelfFilter(BiquadFilter *f, float fs, float f0, float dBgain) {
-    float A = powf(10.0f, dBgain / 40.0f);
-    float w0 = 2.0f * (float)M_PI * f0 / fs;
-    float cosw0 = cosf(w0);
-    float sinw0 = sinf(w0);
-    float alpha = sinw0 * 0.5f * sqrtf((A + 1.0f / A) * (1.0f / 0.85f - 1.0f) + 2.0f);
-    float beta = 2.0f * sqrtf(A) * alpha;
-
-    float a0 = (A + 1.0f) + (A - 1.0f) * cosw0 + beta;
-    f->b0 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 + beta)) / a0;
-    f->b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosw0)) / a0;
-    f->b2 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 - beta)) / a0;
-    f->a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cosw0)) / a0;
-    f->a2 = ((A + 1.0f) + (A - 1.0f) * cosw0 - beta) / a0;
-}
-
 static void SetupPeakingFilter(BiquadFilter *f, float fs, float f0, float Q, float dBgain) {
-    if (f0 > fs * 0.42f) f0 = fs * 0.42f;
+    if (f0 > fs * 0.43f) f0 = fs * 0.43f;
     float A = powf(10.0f, dBgain / 40.0f);
     float w0 = 2.0f * (float)M_PI * f0 / fs;
     float cosw0 = cosf(w0);
@@ -332,7 +316,7 @@ static void SetupPeakingFilter(BiquadFilter *f, float fs, float f0, float Q, flo
 }
 
 static void SetupHighPassFilter(BiquadFilter *f, float fs, float f0, float Q) {
-    if (f0 > fs * 0.42f) f0 = fs * 0.42f;
+    if (f0 > fs * 0.43f) f0 = fs * 0.43f;
     float w0 = 2.0f * (float)M_PI * f0 / fs;
     float cosw0 = cosf(w0);
     float alpha = sinf(w0) / (2.0f * Q);
@@ -354,126 +338,130 @@ static inline float ProcessBiquad(BiquadFilter *f, float x) {
     return y;
 }
 
-static void ConfigureVocalChain(HQAudioContext *ctx, HQVoiceLevel level) {
+static void ConfigureCrystalClearChain(HQAudioContext *ctx, HQVoiceLevel level) {
     float fs = (ctx->sampleRate > 0.0) ? (float)ctx->sampleRate : 16000.0f;
-    float chestDb = 0.0f;
+    float deMudDb = 0.0f;
     float airDb = 0.0f;
 
     switch (level) {
         case HQVoiceLevelLow:
-            chestDb = 2.5f;
-            airDb = 4.0f;
+            deMudDb = -2.0f;
+            airDb = 4.5f;
             break;
         case HQVoiceLevelMedium:
-            chestDb = 4.8f;
-            airDb = 6.8f;
+            deMudDb = -3.2f;
+            airDb = 7.2f;
             break;
         case HQVoiceLevelHigh:
-            chestDb = 6.8f;
-            airDb = 9.2f;
+            deMudDb = -4.5f; // 砍掉 260Hz 闷罐浑浊感，人声立刻变干净
+            airDb = 9.8f;    // 大幅提亮 5.2kHz 空气感与唇齿细节
             break;
         default:
             break;
     }
 
-    memset(&ctx->chestShelf, 0, sizeof(BiquadFilter));
-    memset(&ctx->airPeak, 0, sizeof(BiquadFilter));
+    memset(&ctx->highPass115Hz, 0, sizeof(BiquadFilter));
+    memset(&ctx->deMud260Hz, 0, sizeof(BiquadFilter));
+    memset(&ctx->airSparkle5kHz, 0, sizeof(BiquadFilter));
     memset(&ctx->exciterBand, 0, sizeof(BiquadFilter));
 
-    SetupLowShelfFilter(&ctx->chestShelf, fs, 165.0f, chestDb);
-    SetupPeakingFilter(&ctx->airPeak, fs, 3500.0f, 1.05f, airDb);
-    SetupHighPassFilter(&ctx->exciterBand, fs, 2400.0f, 0.85f);
+    SetupHighPassFilter(&ctx->highPass115Hz, fs, 115.0f, 0.707f);
+    SetupPeakingFilter(&ctx->deMud260Hz, fs, 260.0f, 1.25f, deMudDb);
+    SetupPeakingFilter(&ctx->airSparkle5kHz, fs, 5200.0f, 0.90f, airDb);
+    SetupHighPassFilter(&ctx->exciterBand, fs, 3200.0f, 0.85f);
+
+    ctx->gateGain = 1.0f;
     ctx->configuredLevel = level;
 }
 
-static void ProcessStudioVocalBuffer(HQAudioContext *ctx, AudioQueueBufferRef inBuffer, HQVoiceLevel level) {
+static void ProcessCrystalVocalBuffer(HQAudioContext *ctx, AudioQueueBufferRef inBuffer, HQVoiceLevel level) {
     if (level == HQVoiceLevelOff || !inBuffer || !inBuffer->mAudioData || inBuffer->mAudioDataByteSize == 0) return;
 
     if (ctx->configuredLevel != level) {
-        ConfigureVocalChain(ctx, level);
+        ConfigureCrystalClearChain(ctx, level);
     }
 
-    // 参数配置：含关闭 iOS 通话 AGC 后的音量补偿 + 高频谐波激励混合比
     float makeupGain = 1.0f;
-    float harmonicMix = 0.0f;
-    float chestSat = 0.0f;
+    float airHarmonicMix = 0.0f;
     float compStrength = 0.0f;
+    float gateThreshold = 0.008f;
 
     switch (level) {
         case HQVoiceLevelLow:
-            makeupGain = 1.75f;
-            harmonicMix = 0.14f;
-            chestSat = 0.08f;
+            makeupGain = 1.65f;
+            airHarmonicMix = 0.12f;
             compStrength = 0.25f;
+            gateThreshold = 0.007f;
             break;
         case HQVoiceLevelMedium:
-            makeupGain = 2.65f;
-            harmonicMix = 0.28f;
-            chestSat = 0.16f;
-            compStrength = 0.42f;
+            makeupGain = 2.40f;
+            airHarmonicMix = 0.24f;
+            compStrength = 0.40f;
+            gateThreshold = 0.010f;
             break;
         case HQVoiceLevelHigh:
-            makeupGain = 3.65f; // +11.2dB，补偿 Measurement 模式无 AGC 的音量损失，声底厚实饱满
-            harmonicMix = 0.42f; // 生成高频偶次谐波，穿透 SILK 压缩带来清晰唇齿空气感
-            chestSat = 0.24f;    // 模拟电容麦近讲效应的暖厚胸腔饱和
-            compStrength = 0.58f;
+            makeupGain = 3.20f;
+            airHarmonicMix = 0.36f; // 仅对 3.2kHz 以上高频做空气感谐波激励，绝不浑浊
+            compStrength = 0.55f;
+            gateThreshold = 0.013f; // 说话间隙压低房间底噪，衬托人声清透度
             break;
         default:
             return;
     }
 
-    float hpPrevX = ctx->hpPrevX;
-    float hpPrevY = ctx->hpPrevY;
     float env = ctx->envFollower;
+    float gateGain = ctx->gateGain;
 
     if (ctx->isFloat32) {
         float *samples = (float *)inBuffer->mAudioData;
         UInt32 count = inBuffer->mAudioDataByteSize / sizeof(float);
         for (UInt32 i = 0; i < count; i++) {
             float x = samples[i];
-            float hp = x - hpPrevX + 0.970f * hpPrevY;
-            hpPrevX = x;
-            hpPrevY = hp;
+            float hp = ProcessBiquad(&ctx->highPass115Hz, x);
+            float clean = ProcessBiquad(&ctx->deMud260Hz, hp);
+            float crisp = ProcessBiquad(&ctx->airSparkle5kHz, clean);
 
-            float eq = ProcessBiquad(&ctx->airPeak, ProcessBiquad(&ctx->chestShelf, hp));
-            // 谐波激励器：合成高频偶次谐波，消除闷罐感
-            float hiBand = ProcessBiquad(&ctx->exciterBand, hp);
-            float excited = eq + harmonicMix * tanhf(hiBand * 3.5f) * 0.25f + chestSat * tanhf(eq * 2.2f) * 0.18f;
+            // 高频空气感谐波激励（不碰低频，保持声音干净晶莹）
+            float hiOnly = ProcessBiquad(&ctx->exciterBand, clean);
+            float excited = crisp + airHarmonicMix * tanhf(hiOnly * 4.5f) * 0.20f;
 
             float absSig = fabsf(excited);
-            env = 0.995f * env + 0.005f * absSig;
-            float ratio = (env > 0.09f) ? (1.0f - compStrength * ((env - 0.09f) / (env + 0.18f))) : 1.0f;
+            env = (absSig > env) ? (0.92f * env + 0.08f * absSig) : (0.996f * env + 0.004f * absSig);
 
-            float out = tanhf(excited * makeupGain * ratio * 1.15f) * 0.95f;
-            samples[i] = out;
+            // 自适应底噪门限：无人说话时平滑压低底噪，说话瞬间立刻打开
+            float targetGate = (env < gateThreshold) ? 0.18f : 1.0f;
+            gateGain = (targetGate > gateGain) ? (0.90f * gateGain + 0.10f * targetGate) : (0.995f * gateGain + 0.005f * targetGate);
+
+            float compRatio = (env > 0.09f) ? (1.0f - compStrength * ((env - 0.09f) / (env + 0.18f))) : 1.0f;
+            samples[i] = tanhf(excited * makeupGain * gateGain * compRatio) * 0.96f;
         }
     } else {
         int16_t *samples = (int16_t *)inBuffer->mAudioData;
         UInt32 count = inBuffer->mAudioDataByteSize / sizeof(int16_t);
         for (UInt32 i = 0; i < count; i++) {
-            // 归一化到 [-1.0, 1.0] 进行高精度浮点处理
             float x = (float)samples[i] / 32768.0f;
 
-            // 1) 75Hz 高通去喷麦低频轰鸣
-            float hp = x - hpPrevX + 0.970f * hpPrevY;
-            hpPrevX = x;
-            hpPrevY = hp;
+            // 1) 115Hz 高通去低频闷声
+            float hp = ProcessBiquad(&ctx->highPass115Hz, x);
+            // 2) 260Hz 削减浑浊共振（消除电话听筒闷罐感）
+            float clean = ProcessBiquad(&ctx->deMud260Hz, hp);
+            // 3) 5.2kHz 拉满清透空气感
+            float crisp = ProcessBiquad(&ctx->airSparkle5kHz, clean);
 
-            // 2) 双频段电台 EQ（165Hz 磁性 + 3.5kHz 通透）
-            float eq = ProcessBiquad(&ctx->airPeak, ProcessBiquad(&ctx->chestShelf, hp));
+            // 4) 纯高频空气谐波激励
+            float hiOnly = ProcessBiquad(&ctx->exciterBand, clean);
+            float excited = crisp + airHarmonicMix * tanhf(hiOnly * 4.5f) * 0.20f;
 
-            // 3) 谐波激励器（Aural Exciter）：生成偶次谐波，直接穿透 SILK 编码器
-            float hiBand = ProcessBiquad(&ctx->exciterBand, hp);
-            float hiHarmonics = tanhf(hiBand * 4.0f) * 0.22f;
-            float warmHarmonics = tanhf(eq * 2.4f) * 0.16f;
-            float excited = eq + harmonicMix * hiHarmonics + chestSat * warmHarmonics;
-
-            // 4) 播客级动态包络压缩 + 软饱和防爆音
+            // 5) 包络追踪 + 智能底噪门限 + 动态压缩
             float absSig = fabsf(excited);
-            env = 0.995f * env + 0.005f * absSig;
-            float ratio = (env > 0.09f) ? (1.0f - compStrength * ((env - 0.09f) / (env + 0.18f))) : 1.0f;
+            env = (absSig > env) ? (0.92f * env + 0.08f * absSig) : (0.996f * env + 0.004f * absSig);
 
-            float out = tanhf(excited * makeupGain * ratio * 1.15f) * 0.95f;
+            float targetGate = (env < gateThreshold) ? 0.18f : 1.0f;
+            gateGain = (targetGate > gateGain) ? (0.90f * gateGain + 0.10f * targetGate) : (0.995f * gateGain + 0.005f * targetGate);
+
+            float compRatio = (env > 0.09f) ? (1.0f - compStrength * ((env - 0.09f) / (env + 0.18f))) : 1.0f;
+            float out = tanhf(excited * makeupGain * gateGain * compRatio) * 0.96f;
+
             int32_t pcmOut = (int32_t)(out * 32767.0f);
             if (pcmOut > 32767) pcmOut = 32767;
             if (pcmOut < -32768) pcmOut = -32768;
@@ -481,13 +469,12 @@ static void ProcessStudioVocalBuffer(HQAudioContext *ctx, AudioQueueBufferRef in
         }
     }
 
-    ctx->hpPrevX = hpPrevX;
-    ctx->hpPrevY = hpPrevY;
     ctx->envFollower = env;
+    ctx->gateGain = gateGain;
 }
 
 // ==========================================
-// 6. AudioQueue 拦截（精确命中微信 8.0.75 录音通道，绝不改采样率）
+// 6. AudioQueue 拦截（完全同步采样率，零变调）
 // ==========================================
 static void HQ_AudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer, const AudioTimeStamp *inStartTime, UInt32 inNumberPacketDescriptions, const AudioStreamPacketDescription *inPacketDescs) {
     HQAudioContext *ctx = (HQAudioContext *)inUserData;
@@ -500,7 +487,7 @@ static void HQ_AudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ, Aud
 
     HQVoiceLevel level = GetCurrentVoiceLevel();
     if (level != HQVoiceLevelOff) {
-        ProcessStudioVocalBuffer(ctx, inBuffer, level);
+        ProcessCrystalVocalBuffer(ctx, inBuffer, level);
     }
 
     ctx->origCallback(ctx->origUserData, inAQ, inBuffer, inStartTime, inNumberPacketDescriptions, inPacketDescs);
@@ -509,7 +496,6 @@ static void HQ_AudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ, Aud
 static OSStatus (*orig_AudioQueueNewInput)(const AudioStreamBasicDescription *inFormat, AudioQueueInputCallback inCallbackProc, void *inUserData, CFRunLoopRef inCallbackRunLoop, CFStringRef inCallbackRunLoopMode, UInt32 inFlags, AudioQueueRef *outAQ);
 
 static OSStatus my_AudioQueueNewInput(const AudioStreamBasicDescription *inFormat, AudioQueueInputCallback inCallbackProc, void *inUserData, CFRunLoopRef inCallbackRunLoop, CFStringRef inCallbackRunLoopMode, UInt32 inFlags, AudioQueueRef *outAQ) {
-    // 铁律：原样透传 inFormat，绝不改 mSampleRate，100% 杜绝魔兽音/变调
     if (inCallbackProc != NULL && inFormat != NULL) {
         uint32_t idx = atomic_fetch_add(&gContextCursor, 1) % kMaxHQContexts;
         HQAudioContext *ctx = &gAudioContexts[idx];
@@ -556,8 +542,47 @@ static AVAudioSessionMode ResolveMappedAudioMode(AVAudioSessionMode mode) {
 @end
 
 // ==========================================
-// 8. 安全追踪 SilkAudioRecorder C++ 指针解锁 40kbps（绝不改采样率）
+// 8. 同步解锁 SilkAudioRecorder 24kHz 采样率与 40kbps 码率（防变调）
 // ==========================================
+static void SyncUpgradeSilkRecorderObjC(id recorderObj, BOOL allow24kSampleRate) {
+    HQVoiceLevel level = GetCurrentVoiceLevel();
+    if (level == HQVoiceLevelOff || !recorderObj) return;
+
+    int targetBitRate = (level == HQVoiceLevelHigh) ? 40000 : ((level == HQVoiceLevelMedium) ? 32000 : 24000);
+    unsigned int ivarCount = 0;
+    Ivar *ivars = class_copyIvarList([recorderObj class], &ivarCount);
+    if (!ivars) return;
+
+    uint8_t *basePtr = (uint8_t *)(__bridge void *)recorderObj;
+    for (unsigned int i = 0; i < ivarCount; i++) {
+        const char *rawName = ivar_getName(ivars[i]);
+        const char *typeEnc = ivar_getTypeEncoding(ivars[i]);
+        if (!rawName || !typeEnc) continue;
+
+        NSString *name = [[NSString stringWithUTF8String:rawName] lowercaseString];
+        ptrdiff_t offset = ivar_getOffset(ivars[i]);
+
+        // 仅在 prepareRecord 执行前同步拉高采样率，确保 AudioQueue 和编码器两端一致（绝不变调）
+        if (allow24kSampleRate && [name containsString:@"samplerate"]) {
+            if (strcmp(typeEnc, "i") == 0 || strcmp(typeEnc, "I") == 0) {
+                if (*(int *)(basePtr + offset) == 16000) {
+                    *(int *)(basePtr + offset) = 24000;
+                }
+            } else if (strcmp(typeEnc, "d") == 0) {
+                if (*(double *)(basePtr + offset) == 16000.0) {
+                    *(double *)(basePtr + offset) = 24000.0;
+                }
+            }
+        } else if ([name containsString:@"bitrate"]) {
+            if (strcmp(typeEnc, "i") == 0 || strcmp(typeEnc, "I") == 0) {
+                *(int *)(basePtr + offset) = targetBitRate;
+                atomic_store(&gSilkPatched, YES);
+            }
+        }
+    }
+    free(ivars);
+}
+
 static BOOL TryPatchSilkControlAtAddress(uintptr_t baseAddr, int targetBitRate) {
     int32_t buf[64] = {0};
     vm_size_t outSize = 0;
@@ -576,7 +601,6 @@ static BOOL TryPatchSilkControlAtAddress(uintptr_t baseAddr, int targetBitRate) 
             (pktSz == 320 || pktSz == 480) &&
             (br >= 8000 && br <= 32000)) {
             int32_t *liveWords = (int32_t *)(baseAddr + (uintptr_t)i * sizeof(int32_t));
-            // 保持 apiSr 和 pktSz 不变（绝不变调），拉高码率至 40kbps 并关闭静音吞音
             liveWords[1] = 24000;
             liveWords[3] = targetBitRate;
             liveWords[5] = 2; // complexity = 2
@@ -588,20 +612,18 @@ static BOOL TryPatchSilkControlAtAddress(uintptr_t baseAddr, int targetBitRate) 
     return NO;
 }
 
-static void PatchSilkRecorderDeep(id recorderObj) {
+static void PatchSilkRecorderMemory(id recorderObj) {
     HQVoiceLevel level = GetCurrentVoiceLevel();
     if (level == HQVoiceLevelOff || !recorderObj) return;
 
     int targetBitRate = (level == HQVoiceLevelHigh) ? 40000 : ((level == HQVoiceLevelMedium) ? 32000 : 24000);
     uintptr_t objAddr = (uintptr_t)(__bridge void *)recorderObj;
 
-    // 1. 先检查对象自身内存
     if (TryPatchSilkControlAtAddress(objAddr, targetBitRate)) {
         atomic_store(&gSilkPatched, YES);
         return;
     }
 
-    // 2. 安全追踪一级 C++ 成员指针（使用内核 vm_read_overwrite 杜绝野指针闪退）
     uintptr_t ptrSlots[48] = {0};
     vm_size_t outSize = 0;
     if (vm_read_overwrite(mach_task_self(), (vm_address_t)objAddr, sizeof(ptrSlots), (vm_address_t)ptrSlots, &outSize) == KERN_SUCCESS) {
@@ -617,17 +639,19 @@ static void PatchSilkRecorderDeep(id recorderObj) {
     }
 }
 
-@implementation NSObject (HQSilkRecorderDeepHook)
+@implementation NSObject (HQSilkRecorderCrystalHook)
 
 - (BOOL)hq_prepareRecord {
+    SyncUpgradeSilkRecorderObjC(self, YES);
     BOOL ret = [self hq_prepareRecord];
-    PatchSilkRecorderDeep(self);
+    PatchSilkRecorderMemory(self);
     return ret;
 }
 
 - (BOOL)hq_prepareRecordWithNotify:(BOOL)notify {
+    SyncUpgradeSilkRecorderObjC(self, YES);
     BOOL ret = [self hq_prepareRecordWithNotify:notify];
-    PatchSilkRecorderDeep(self);
+    PatchSilkRecorderMemory(self);
     return ret;
 }
 
