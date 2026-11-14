@@ -1,0 +1,33 @@
+name: Build WeChatHQVoice Dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile WeChatHQVoice.dylib
+        run: |
+          clang -arch arm64 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -Wno-deprecated-declarations \
+            -dynamiclib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework AVFoundation \
+            -framework AudioToolbox \
+            Tweak.m -o WeChatHQVoice.dylib
+
+      - name: Upload compiled dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatHQVoice-dylib
+          path: WeChatHQVoice.dylib
